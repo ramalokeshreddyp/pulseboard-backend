@@ -1,113 +1,257 @@
-# PulseBoard: Real-Time Collaborative Operations Platform Backend with Redis
+# ⚡ PulseBoard: Real-Time Collaborative Operations Platform
 
-PulseBoard is a high-performance, real-time backend platform designed for remote engineering and operations teams to coordinate incidents, deployments, and other live operations events. 
+[![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com/)
+[![Redis](https://img.shields.io/badge/redis-%23DD0031.svg?style=for-the-badge&logo=redis&logoColor=white)](https://redis.io/)
+[![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/)
+[![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)](https://www.python.org/)
 
-To solve production scaling bottlenecks—such as API response lag, database overload, and real-time sync delays—PulseBoard uses **Redis** as a core component for real-time state, message broker services, caching, rate limiting, and analytics.
+PulseBoard is a high-performance, real-time backend engine engineered for remote SRE, Devops, and operations teams to coordinate incidents, system deployments, and live operations events. 
+
+To solve common production bottlenecks—such as inconsistent API latency, notification lag, and database read/write strain—PulseBoard utilizes **Redis** as a core component for real-time state, session storage, rate limiting, pub/sub messaging, event streaming, distributed coordination, and telemetry analytics.
 
 ---
 
-## 🏗️ Architecture Overview
+## 🗺️ System Architecture
 
-The system consists of three distinct service layers that communicate asynchronously and statefully via Redis:
-
-1. **API Server (FastAPI)**: Serves REST requests, performs authentication, handles input validation, increments rate limiters, queries analytics, and triggers real-time events.
-2. **Background Worker (Python Asyncio)**: Processes long-running operations in the background. It implements:
-   - A **Job Queue consumer** using Redis lists.
-   - An **Event Stream processor** using consumer groups to guarantee at-least-once delivery.
-   - A **Pub/Sub logger** to subscribe to live broadcast channels.
-3. **Redis Data Store**: The multi-model in-memory engine storing active sessions, workspace members, activity logs, presence details, geospatial coordinates, and daily metrics.
+PulseBoard uses a decoupled, event-driven architecture that separates REST request handling from asynchronous background workloads using Redis data structures:
 
 ```mermaid
 graph TD
-    Client[Web/Mobile Client] -->|HTTP Requests| API[API Server]
-    API -->|Session / Cache / Rate Limits| Redis[(Redis)]
-    API -->|Enqueue Jobs / Streams| Redis
-    Worker[Worker Service] -->|BRPOP Jobs / XREADGROUP Streams| Redis
-    Worker -->|Log / Process| Log[Console / Logger]
-    Sub[PubSub Log Subscriber] -->|SUBSCRIBE| Redis
+    %% Clients
+    Client[Web & Mobile Clients]
+    
+    %% API Tier
+    subgraph API_Server [API Gateway Server - FastAPI]
+        Router[FastAPI Route Handlers]
+        Auth[Bearer Auth Middleware]
+        Limiter[Rate Limit Check]
+    end
+
+    %% Storage & Messaging Tier
+    subgraph Redis_Layer [Redis Operational Layer]
+        SessionStore[Session Store: Strings]
+        PresenceSet[Presence Registry: Set]
+        ProfileHash[Profiles Store: Hashes]
+        FeedList[Activity Feeds: Lists]
+        JobQueue[Job Queue: Lists]
+        EventStream[Event Stream: Streams]
+        TrendingZSet[Trending Channels: ZSet]
+        GeoIndex[Geospatial Registry: Geo]
+        LockKey[Mutex Locks: Strings]
+    end
+
+    %% Worker Tier
+    subgraph Worker_Tier [Background Processing Service]
+        JobWorker[Job Queue Consumer - BRPOP]
+        StreamWorker[Stream Consumer - XREADGROUP]
+        PubSubWorker[Pub/Sub Subscriber]
+    end
+
+    %% Connections
+    Client -->|REST API| Router
+    Router --> Auth
+    Auth --> Limiter
+    
+    Limiter -->|Session check| SessionStore
+    Limiter -->|Verify quota| Redis_Layer
+    
+    Router -->|Store profile| ProfileHash
+    Router -->|Add event| EventStream
+    Router -->|Push task| JobQueue
+    Router -->|Acquire Lock| LockKey
+    
+    %% Worker Polling
+    JobWorker -->|Blocking pop| JobQueue
+    StreamWorker -->|Consume & ACK| EventStream
+    PubSubWorker -->|Subscribe Logs| Redis_Layer
 ```
 
 ---
 
-## 🔑 Redis Key Naming Schema
+## 🔄 Execution & Data Flows
 
-We employ the industry-standard naming pattern `namespace:object_type:id:attribute`.
+### 1. Bearer Authentication & Sliding Rate Limiter Flow
+All authenticated routes execute session validation and checking of minute quotas before dispatching queries:
 
-| Namespace / Key | Redis Data Structure | Description / Access Pattern |
-| :--- | :--- | :--- |
-| `session:{token}` | **String** | Authenticated session token mapping to `user_id`. Expired automatically (TTL: 3600s). |
-| `rate_limit:{user_id}:{minute_timestamp}` | **String** | User-specific atomic counter mapping to a 1-minute window. Expired automatically (TTL: 60s). |
-| `user:{user_id}` | **Hash** | Holds structured user profiles (`name`, `email`, `role`, `created_at`). |
-| `online_users` | **Set** | Set of active online user IDs. Supports fast $O(1)$ presence membership lookups. |
-| `workspace:{id}:members` | **Set** | User IDs belonging to a specific workspace. |
-| `user:{id}:workspaces` | **Set** | Workspaces a specific user belongs to. Allows intersecting shared workspaces via `SINTER`. |
-| `feed:{user_id}` | **List** | Personal operational activity feed. Append-only events capped at 100 items via `LTRIM`. |
-| `channel:{id}:messages` | **Pub/Sub Channel** | Real-time chat messaging broadcast. |
-| `channel:{id}:typing` | **Pub/Sub Channel** | Real-time typing indicators. |
-| `stream:events` | **Stream** | Append-only event log for microservices coordination. Read by a consumer group. |
-| `trending:channels` | **Sorted Set (ZSET)** | Channel activity rankings where score represents event volume. |
-| `reputation:users` | **Sorted Set (ZSET)** | Gamified reputation score for active operations engineers. |
-| `lock:{lock_name}` | **String** | Distributed mutual exclusion lock. Acquired via `SET NX EX` and released via atomic Lua. |
-| `analytics:dau:{YYYY-MM-DD}` | **HyperLogLog (HLL)** | Cardinality estimation tracker for Daily Active Users (DAU) in $O(1)$ space. |
-| `attendance:{user_id}:{YYYY-MM}` | **Bitmap** | Dense binary array tracking daily login attendance for the month (offsets 1-31). |
-| `geo:active_users` | **Geo Set (GEO)** | Coordinates index of online users. Supports radius search. |
-| `jobs:queue` | **List** | Job queue for asynchronous background tasks. Popped via blocking `BRPOP`. |
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant API as API Server
+    participant Redis as Redis Cache
+
+    Client->>API: HTTP Request (Headers: Bearer <token>)
+    API->>Redis: GET session:{token}
+    alt Token Exists
+        Redis-->>API: Returns user_id
+        API->>Redis: EXPIRE session:{token} 3600 (Refresh sliding TTL)
+        API->>Redis: INCR rate_limit:{user_id}:{minute_timestamp}
+        Redis-->>API: Returns request_count
+        alt request_count <= Limit
+            API->>API: Route execution...
+            API-->>Client: HTTP 200 OK (Response Payload)
+        else request_count > Limit
+            API-->>Client: HTTP 429 Too Many Requests
+        end
+    else Token Expired/Invalid
+        Redis-->>API: Returns nil
+        API-->>Client: HTTP 401 Unauthorized
+    end
+```
+
+### 2. Asynchronous Job & Event Stream Processing
+Long-running jobs are enqueued onto a List queue, and telemetry updates are streamed using Redis Streams:
+
+```mermaid
+graph LR
+    subgraph Producers [API Server Producers]
+        API_Job[POST /jobs]
+        API_Stream[POST /events]
+    end
+
+    subgraph Broker [Redis Broker]
+        Queue[jobs:queue - List]
+        Stream[stream:events - Stream]
+    end
+
+    subgraph Consumers [Background Worker Consumers]
+        Worker_Queue[Queue Consumer - BRPOP]
+        Worker_Stream[Stream Group Consumer - XREADGROUP]
+    end
+
+    API_Job -->|LPUSH| Queue
+    API_Stream -->|XADD| Stream
+
+    Queue -->|BRPOP Dequeue| Worker_Queue
+    Stream -->|XREADGROUP| Worker_Stream
+    Worker_Stream -->|XACK Acknowledge| Stream
+```
+
+### 3. Distributed Mutual Exclusion Lock Path
+Coordinating periodic routines (e.g. daily report compiling) safely using Redis distributed locking:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant WorkerA as API Worker A
+    participant Redis as Redis Server
+    participant WorkerB as API Worker B
+
+    Note over WorkerA, WorkerB: Task: Generate Daily Digest Report
+
+    WorkerA->>Redis: SET lock:daily_digest worker_a NX EX 10
+    Redis-->>WorkerA: Returns OK (Lock Acquired)
+    
+    WorkerB->>Redis: SET lock:daily_digest worker_b NX EX 10
+    Redis-->>WorkerB: Returns nil (Lock Failed)
+    Note over WorkerB: Worker B aborts task immediately
+
+    Note over WorkerA: Worker A executes report task (sleep 2s)
+    
+    WorkerA->>Redis: EVAL LuaScript(lock:daily_digest, worker_a)
+    Note over Redis: Lua script checks if owner matches worker_a
+    Redis->>Redis: DEL lock:daily_digest
+    Redis-->>WorkerA: Returns 1 (Lock Released)
+```
 
 ---
 
-## 🚀 Setup & Run Instructions
+## 📂 Codebase Folder Structure
 
-### Prerequisites
-- Docker & Docker Compose
-- *Port note*: If port `6379` is already bound on your system (e.g. by another active database), the compose configuration is preset to map Redis to **`6389`** on the host. Host services remain unaffected, and containers communicate internally on container-to-container port `6379`.
-
-### 1. Configure the Environment
-Copy the example environment file:
-```bash
-cp .env.example .env
+```text
+pulseboard-backend/
+├── app/
+│   ├── __init__.py
+│   ├── config.py          # Configuration loading using pydantic-settings
+│   ├── main.py            # FastAPI REST routing definitions & middleware
+│   ├── mock_data.py       # Initial operational database seeder
+│   ├── redis_client.py    # Connection pools and Distributed Lock module
+│   └── worker.py          # Background queues and stream event consumer
+├── .env                   # Local configuration file (ignored by Git)
+├── .env.example           # Example config configuration template
+├── .gitignore             # Git ignored paths and rules
+├── Dockerfile             # Multi-stage container definition
+├── docker-compose.yml     # Services link configuration (Redis, API, Worker)
+├── requirements.txt       # Python dependency declarations
+└── verify_pulseboard.py   # E2E Automated Integration Test Suite
 ```
 
-### 2. Boot Up the Containers
-Run Docker Compose in detached mode:
-```bash
-docker compose up --build -d
-```
-This builds the Python images, spawns Redis, and spins up both services. **Seed data is automatically loaded** into Redis by the API server upon startup.
+---
 
-### 3. Verify Container Status
-Check that all three containers are active:
-```bash
-docker ps
-```
-You should see:
-- `pulseboard-redis` running on port `6389->6379`
-- `pulseboard-api` running on port `8000->8000`
-- `pulseboard-worker` running as a background service
+## 🚀 Setup & Installation Steps
 
-### 4. Check Service Logs
-To view the API server boots, automatic seeder runs, or the background workers processing queues:
-```bash
-docker logs -f pulseboard-api
-docker logs -f pulseboard-worker
-```
+### Option A: Running via Docker Compose (Recommended)
+
+1. **Configure Environment**:
+   ```bash
+   cp .env.example .env
+   ```
+   *Note*: The `.env` template configures Redis to bind to port **`6389`** on the host. This prevents port allocation conflicts if there is already an active Redis server running on your system on port `6379`.
+
+2. **Boot up Services**:
+   ```bash
+   docker compose up --build -d
+   ```
+   This automatically:
+   - Builds the python runner container.
+   - Spins up Redis (`pulseboard-redis`), API Server (`pulseboard-api`), and background worker (`pulseboard-worker`).
+   - **Auto-seeds mock workspaces, members, profiles, channels, activity metrics, and active locations on boot**.
+
+3. **Check Logs**:
+   ```bash
+   docker compose logs -f
+   ```
+
+---
+
+### Option B: Running Locally
+
+1. **Install Prerequisites**:
+   Python 3.11+ is required. Set up a virtual environment and install packages:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+
+2. **Configure Port Settings**:
+   Create a `.env` file and make sure `REDIS_PORT` matches your running local Redis instance:
+   ```env
+   REDIS_HOST=localhost
+   REDIS_PORT=6379 # Or 6389
+   ```
+
+3. **Run seeder**:
+   ```bash
+   python -m app.mock_data
+   ```
+
+4. **Start Web Server**:
+   ```bash
+   uvicorn app.main:app --port 8000 --reload
+   ```
+
+5. **Start Worker Service**:
+   ```bash
+   python -m app.worker
+   ```
 
 ---
 
 ## 🧪 Integration Testing & Verification
 
-We have included a comprehensive end-to-end integration test suite `verify_pulseboard.py` that validates all 12 core requirements programmatically.
+A comprehensive automated integration test suite (`verify_pulseboard.py`) is provided. It hits all FastAPI endpoints to assert they correspond to correct Redis commands.
 
-To run the verification suite inside the running API container:
+To execute the tests inside the running API container:
 ```bash
 docker compose exec api python verify_pulseboard.py
 ```
 
-### Expected Output
+### Output Results
 ```text
 ==================================================
 Starting PulseBoard Redis Backend Integration Tests
 ==================================================
-
 Testing: 1. Sessions & Authentication
 [✓] Login successful. User ID: usr_cd8aab92, Session Token: f1fe038f...
 
@@ -151,67 +295,21 @@ ALL INTEGRATION TESTS PASSED SUCCESSFULLY! (12/12)
 
 ---
 
-## 🛠️ REST API Specification & Redis Usage Reference
+## ⚙️ Redis Usage & Commands Reference
 
-### 1. Authentication & Sessions
-- **POST `/auth/login`**: Accepts `{ "email": "...", "name": "...", "role": "..." }`. Generates user UUID and session token.
-  - *Redis Command*: `HSET user:{user_id} ...` (Profile Hash setup)
-  - *Redis Command*: `SETEX session:{session_token} 3600 {user_id}` (Session String with 1h TTL)
-  - *Redis Command*: `SADD online_users {user_id}` (Presence Set append)
-- **POST `/auth/logout`**: Closes the current session.
-  - *Redis Command*: `DEL session:{session_token}`
-  - *Redis Command*: `SREM online_users {user_id}`
-
-### 2. User Profiles
-- **GET `/users/{user_id}/profile`**: Retrieves entire profile hash.
-  - *Redis Command*: `HGETALL user:{user_id}`
-- **PUT `/users/{user_id}/profile`**: Updates specific profile keys.
-  - *Redis Command*: `HSET user:{user_id} field value`
-- **GET `/users/{user_id}/profile/fields`**: Retrieves a subset of fields.
-  - *Redis Command*: `HMGET user:{user_id} field1 field2`
-
-### 3. Workspaces & Membership (Transactions)
-- **POST `/workspaces/{workspace_id}/members`**: Adds user to a workspace.
-  - *Redis Pattern*: **MULTI / EXEC Transaction** guarantees atomic execution:
-    ```python
-    SADD workspace:{workspace_id}:members {user_id}
-    SADD user:{user_id}:workspaces {workspace_id}
-    LPUSH feed:{user_id} {workspace_joined_event}
-    LTRIM feed:{user_id} 0 99
-    ```
-- **GET `/workspaces/common`**: Finds shared workspaces between user1 and user2.
-  - *Redis Command*: `SINTER user:{user1}:workspaces user:{user2}:workspaces`
-
-### 4. Real-Time Messaging & Trending Channels
-- **POST `/channels/{channel_id}/messages`**: Broadcasts a message.
-  - *Redis Command*: `PUBLISH channel:{channel_id}:messages {message_payload}`
-  - *Redis Command*: `ZINCRBY trending:channels 1 {channel_id}` (Increments activity rank)
-- **GET `/analytics/trending`**: Retrieves top $N$ active channels.
-  - *Redis Command*: `ZREVRANGE trending:channels 0 N-1 WITHSCORES`
-
-### 5. Distributed Locking
-- **POST `/locks/trigger-daily-digest`**: Attempts to run a lock-protected background task.
-  - *Redis Command (Acquire)*: `SET lock:daily_digest {owner_id} NX EX 10`
-  - *Redis Command (Release)*: Executed via atomic **Lua Script**:
-    ```lua
-    if redis.call("get", KEYS[1]) == ARGV[1] then
-        return redis.call("del", KEYS[1])
-    else
-        return 0
-    end
-    ```
-
-### 6. Geospatial Awareness
-- **POST `/geo/location`**: Logs user coordinates.
-  - *Redis Command*: `GEOADD geo:active_users {longitude} {latitude} {user_id}`
-- **GET `/geo/nearby`**: Finds users within a certain radius.
-  - *Redis Command*: `GEOSEARCH geo:active_users FROMLONLAT {long} {lat} BYRADIUS {radius} {unit} WITHDIST WITHCOORD`
-
----
-
-## ⚡ Key Redis Design Decisions
-
-1. **Transaction Safety (`MULTI`/`EXEC`)**: We wrap workspace joins in a Redis pipeline transaction block. If any operation fails, none are applied, protecting state integrity across workspace membership listings and user feed notifications.
-2. **Distributed Lock Safety**: Simple locks can cause race conditions if client A deletes client B's lock (e.g. after a slow execution timeout). We assign a unique UUID owner tag to each lock request and enforce release strictly via Lua checking `get(key) == owner_id`.
-3. **HyperLogLog for DAU**: Relational databases calculate unique daily users via heavy `COUNT(DISTINCT)` aggregates. PulseBoard uses `PFADD` and `PFCOUNT` to track millions of unique daily operations events in a fixed, extremely lightweight memory profile (12KB per key) with a minor statistical error margin (< 1%).
-4. **Attendance Tracking via Bitmaps**: Active daily logging uses single-bit flags inside a monthly byte array (`attendance:{user_id}:{YYYY-MM}`). By matching offsets to the day of the month, we can track an individual's active timeline for under 4 bytes of memory per user per month.
+| Operational Feature | Target Endpoint | Redis Commands Utilized |
+| :--- | :--- | :--- |
+| **Sessions & Auth** | `POST /auth/login` | `SETEX`, `GET`, `EXPIRE`, `DEL` |
+| **Rate Limiter** | All (Middleware) | `INCR`, `EXPIRE` |
+| **Profiles Store** | `GET /users/:id/profile` | `HSET`, `HGETALL`, `HMGET`, `EXISTS` |
+| **Presence Registry** | `POST /presence/online` | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER` |
+| **Workspace intersection**| `GET /workspaces/common` | `SADD`, `SINTER` |
+| **Activity Feed** | `GET /users/:id/feed` | `LPUSH`, `LTRIM`, `LRANGE` |
+| **Pub/Sub Messaging** | `POST /channels/:id/messages`| `PUBLISH`, `SUBSCRIBE` |
+| **Event Stream Logs** | `POST /events` | `XADD`, `XREADGROUP`, `XACK` |
+| **Trending Channels** | `GET /analytics/trending` | `ZINCRBY`, `ZREVRANGE` |
+| **Mutex Locks** | `POST /locks/trigger-daily-digest`| `SET NX EX`, Lua `EVAL` |
+| **Daily Active Users**| `GET /analytics/dau` | `PFADD`, `PFCOUNT` |
+| **Attendance Bitmaps**| `GET /attendance/:id/count`| `SETBIT`, `GETBIT`, `BITCOUNT` |
+| **Geospatial Queries**| `GET /geo/nearby` | `GEOADD`, `GEOSEARCH` |
+| **Job Queueing** | `POST /jobs` | `LPUSH`, `BRPOP` |
