@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: pulseboard-redis
+    ports:
+      - "6389:6379"
+    volumes:
+      - redis_data:/data
+    restart: always
+
+  api:
+    build: .
+    container_name: pulseboard-api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - API_PORT=8000
+      - RATE_LIMIT_PER_MINUTE=60
+    depends_on:
+      - redis
+    restart: always
+
+  worker:
+    build: .
+    container_name: pulseboard-worker
+    command: python -m app.worker
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+    depends_on:
+      - redis
+    restart: always
+
+volumes:
+  redis_data:
