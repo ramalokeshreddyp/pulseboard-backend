@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import signal
 from app.redis_client import redis_client
 
 logging.basicConfig(
@@ -106,18 +107,39 @@ async def pubsub_worker():
         await pubsub.close()
 
 async def main():
-    # Run all three workers concurrently
-    try:
-        await asyncio.gather(
-            job_queue_worker(),
-            stream_worker(),
-            pubsub_worker()
-        )
-    except asyncio.CancelledError:
-        logger.info("Worker tasks received cancellation signal. Shutting down...")
+    # Create running background tasks
+    tasks = [
+        asyncio.create_task(job_queue_worker()),
+        asyncio.create_task(stream_worker()),
+        asyncio.create_task(pubsub_worker())
+    ]
+    
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def shutdown_handler():
+        logger.info("Received SIGINT/SIGTERM shutdown signal. Gracefully stopping workers...")
+        stop_event.set()
+
+    # Register OS signals
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, shutdown_handler)
+        except NotImplementedError:
+            pass
+
+    # Wait until container sends a stop signal
+    await stop_event.wait()
+    
+    logger.info("Cancelling running worker tasks...")
+    for task in tasks:
+        task.cancel()
+        
+    await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info("All background tasks shut down. Graceful exit completed.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Worker stopped by user.")
+        logger.info("Worker stopped by KeyboardInterrupt.")

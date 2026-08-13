@@ -9,7 +9,12 @@ redis_client = aioredis.Redis(
     port=settings.redis_port,
     password=settings.redis_password or None,
     db=settings.redis_db,
-    decode_responses=True
+    decode_responses=True,
+    health_check_interval=30,
+    retry_on_timeout=True,
+    socket_keepalive=True,
+    socket_timeout=5.0,
+    socket_connect_timeout=5.0
 )
 
 # Sync Redis client for Worker
@@ -18,7 +23,12 @@ sync_redis_client = syncredis.Redis(
     port=settings.redis_port,
     password=settings.redis_password or None,
     db=settings.redis_db,
-    decode_responses=True
+    decode_responses=True,
+    health_check_interval=30,
+    retry_on_timeout=True,
+    socket_keepalive=True,
+    socket_timeout=5.0,
+    socket_connect_timeout=5.0
 )
 
 # Lua script to release lock atomically only if the caller owns it
